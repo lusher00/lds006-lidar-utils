@@ -18,18 +18,19 @@ Protocol, as established by lidar_view.py / lidar_health.py on this unit:
     revolution. angle = (index - 0xA0) * 4 + sample.
   * checksum = sum of bytes 0..19, 16-bit, little endian. Anything else is a
     framing slip, not a packet.
-  * speed_raw / 64 is the documented RPM. On this unit a healthy raw value
-    sits around 21500 (~336), which is NOT 5 Hz — treat the number as a
-    stability indicator, not as calibrated RPM, until it is checked against
-    something else.
-  * Each sample is distance_lo, distance_hi, signal_lo, signal_hi.
-    lidar_view.py reads the full 16-bit distance in mm; the XV-11/Neato
-    family this protocol descends from instead uses bit 15 as "invalid" and
-    bit 14 as "signal warning" with a 14-bit distance. Which one this unit
-    means is NOT settled, so both readings are reported: `dist` is the full
-    16-bit value and the flag counters below say how often those two top bits
-    are set. If `flag_hi` stays at zero in normal use, the full-16-bit reading
-    is right. A distance of 0 means no return either way.
+  * speed_raw / 100 is RPM on this unit, NOT the /64 the XV-11 family uses.
+    Measured against the revolution rate counted from index wraps: 4.97 rev/s
+    = 298 RPM with speed_raw at 29946. /64 would claim 468. The daemon
+    reports the rate it counted alongside the raw field, so this can be
+    re-checked rather than believed.
+  * Each sample is distance_lo, distance_hi, signal_lo, signal_hi, and the
+    distance word carries flags in its top two bits, XV-11 style:
+    bit 15 = no valid return, bit 14 = weak signal, low 14 bits = mm.
+    Established by measurement, not assumption: running in a room, bit 15 was
+    set on 52% of samples while a zero distance never occurred once. Read as
+    a full 16-bit value those samples are 32-65 m, which this module cannot
+    see — so the flag reading is the right one, and a flagged sample is the
+    unit's way of saying "nothing there".
 
 HTTP, all JSON, all CORS-open so a dashboard served from the Bone can read it:
 
@@ -47,6 +48,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import serial
@@ -82,7 +84,11 @@ class Scanner:
         # which is what makes them cheap to poll: the reader never computes a
         # rate, it only counts.
         self.c = dict(bytes=0, packets=0, checksum_bad=0, index_bad=0,
-                      revs=0, zero=0, flag_hi=0, flag_warn=0)
+                      revs=0, zero=0, invalid=0, weak=0)
+        # Timestamps of the last few index wraps. The revolution rate counted
+        # from these is the honest scan rate; everything else about speed on
+        # this unit is the module's own word for it.
+        self.rev_times = deque(maxlen=11)
         self.last_byte = 0.0
         self.started = time.monotonic()
 
@@ -177,14 +183,18 @@ class Scanner:
             if idx == IDX_FIRST:
                 self.rev += 1
                 self.c["revs"] += 1
+                self.rev_times.append(now)
             for s in range(4):
                 off = 4 + s * 4
-                hi = pkt[off + 1]
-                dist = pkt[off] | (hi << 8)
-                if hi & 0x80:
-                    self.c["flag_hi"] += 1
-                if hi & 0x40:
-                    self.c["flag_warn"] += 1
+                word = pkt[off] | (pkt[off + 1] << 8)
+                invalid = bool(word & 0x8000)
+                weak = bool(word & 0x4000)
+                dist = word & 0x3FFF
+                if invalid:
+                    self.c["invalid"] += 1
+                    dist = 0          # no return, which is what 0 means here
+                if weak:
+                    self.c["weak"] += 1
                 if dist == 0:
                     self.c["zero"] += 1
                 a = (base + s) % 360
@@ -201,15 +211,31 @@ class Scanner:
             motor = self.motor
             err = self.serial_error
             fresh = sum(1 for t in self.stamp if now - t < STALE_S)
+            revs = list(self.rev_times)
+        # Counted, not claimed. Stale wraps are ignored so a motor that has
+        # stopped reads 0 rather than the rate it had before it stopped.
+        rpm = 0.0
+        if len(revs) > 1 and now - revs[-1] < 2.0:
+            span = revs[-1] - revs[0]
+            if span > 0:
+                rpm = round((len(revs) - 1) / span * 60.0, 1)
         return {
             "ok": err is None,
             "serial_error": err,
             "port": SERIAL_PORT,
+            # What the daemon last TOLD the motor to do. Whether anything is
+            # actually turning is `spinning`: an unpowered scanner swallows
+            # startlds$ without complaint and would otherwise read as running.
             "motor": motor,
+            "spinning": rpm > 0,
             "uptime_s": round(now - self.started, 1),
             "silence_s": round(now - self.last_byte, 2) if self.last_byte else None,
             "speed_raw": speed_raw,
-            "rpm": round(speed_raw / 64.0, 1),
+            # Measured from index wraps. speed_raw / 100 is the module's own
+            # figure and agrees with it; /64, as the XV-11 family uses, does
+            # not — see the note at the top of this file.
+            "rpm": rpm,
+            "rpm_reported": round(speed_raw / 100.0, 1),
             "points_fresh": fresh,
             "counts": c,
         }

@@ -17,8 +17,13 @@ IDX_FIRST = 0xA0
 IDX_LAST = 0xF9
 
 
-def packet(index, speed_raw=21516, dist=None, sig=320, corrupt=False):
-    """One 22-byte packet. dist is 4 distances in mm, or None for a ramp."""
+def packet(index, speed_raw=29946, dist=None, sig=320, corrupt=False):
+    """One 22-byte packet.
+
+    dist is four distance WORDS — low 14 bits mm, bit 15 no-return, bit 14
+    weak — or None for a ramp of clean returns. Default speed_raw is what the
+    real unit reports at ~298 RPM.
+    """
     if dist is None:
         base = (index - IDX_FIRST) * 4
         dist = [1000 + (base + i) * 5 for i in range(4)]

@@ -86,13 +86,17 @@ def test_decode():
     s.stamp[0] = time.monotonic() - (lidar_server.STALE_S + 0.5)
     check("a stale bin reports -1", s.scan()["dist"][0] == -1)
 
-    # Both readings of the top bits are counted so the open question in the
-    # README can be answered from the numbers rather than argued about.
+    # The top two bits are flags, not distance — settled by measurement on
+    # the real unit; see the note at the top of lidar_server.py.
     s2 = lidar_server.Scanner()
     s2.ingest(fake_serial.packet(0xA0, dist=[0x8123, 0x4123, 5, 0]), time.monotonic())
-    check("bit15 counted", s2.c["flag_hi"] == 1, s2.c)
-    check("bit14 counted", s2.c["flag_warn"] == 1, s2.c)
-    check("a zero distance is counted as no-return", s2.c["zero"] == 1, s2.c)
+    check("bit15 counted as no return", s2.c["invalid"] == 1, s2.c)
+    check("a no-return sample stores 0, not 33 m",
+          s2.dist[0] == 0, s2.dist[0])
+    check("bit14 counted as weak", s2.c["weak"] == 1, s2.c)
+    check("a weak sample keeps its distance, masked to 14 bits",
+          s2.dist[1] == 0x0123, s2.dist[1])
+    check("zero counts both kinds of no-return", s2.c["zero"] == 2, s2.c)
 
 
 # ── the whole daemon, over HTTP ─────────────────────────────────────────
@@ -112,8 +116,14 @@ def test_http():
     check("autostart spun the motor", h["motor"] == "running", h["motor"])
     check("packets are arriving", h["counts"]["packets"] > 100, h["counts"])
     check("rates are populated", h["rates"]["packets"] > 0, h["rates"])
-    check("speed is reported raw and divided",
-          h["speed_raw"] == 21516 and abs(h["rpm"] - 336.2) < 0.2, h["speed_raw"])
+    check("the raw speed field is passed through", h["speed_raw"] == 29946, h["speed_raw"])
+    check("the module's own rpm is raw/100",
+          abs(h["rpm_reported"] - 299.5) < 0.1, h["rpm_reported"])
+    # The fake spins far faster than the real unit; what is being checked is
+    # that the number is COUNTED from index wraps, not derived from the field.
+    check("rpm is measured from index wraps",
+          h["rpm"] > 0 and abs(h["rpm"] - h["rpm_reported"]) > 1, h["rpm"])
+    check("spinning is true while wraps keep arriving", h["spinning"] is True, h)
 
     code, _, s = get("/scan")
     check("/scan answers", code == 200)

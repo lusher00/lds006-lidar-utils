@@ -65,8 +65,9 @@ where it steals it. `/dev/ttyAMA0` exists when that is right.
 | `POST /control` | `{"motor":"start"}` or `{"motor":"stop"}` |
 
 `dist[a]` is `-1` where the bin has not been written in the last 1.5 s, and `0`
-where the scanner reported no return. Both are "nothing there", for different
-reasons, and neither should be plotted as a distance.
+where the scanner reported no return (bit 15 set, or a genuine zero). Both are
+"nothing there", for different reasons, and neither should be plotted as a
+distance. Everything else is millimetres, 14-bit, so the ceiling is 16 383.
 
 Every response carries `Access-Control-Allow-Origin: *`, because the bot
 dashboard is served from the BeagleBone and is therefore always cross-origin.
@@ -95,31 +96,38 @@ Established on this unit, with the scripts in this repo:
 * checksum = the arithmetic sum of bytes 0–19, 16-bit little endian. A packet
   that fails it is a framing slip, not a bad reading — which is why the daemon
   checks it *before* accepting a byte position as a packet boundary.
-* Each sample is distance_lo, distance_hi, signal_lo, signal_hi.
-* `speed_raw / 64` is the documented RPM. On this unit a healthy raw value sits
-  near **21500**, which comes out as ~336 — not a believable scan rate for a
-  unit doing about 5 revolutions a second. Treat it as a stability indicator
-  until it has been checked against something physical; the daemon counts the
-  real revolution rate from index wraps instead.
+* Each sample is distance_lo, distance_hi, signal_lo, signal_hi, and the
+  distance word carries flags in its top two bits, XV-11 style: **bit 15 = no
+  valid return, bit 14 = weak signal, low 14 bits = millimetres.**
+* **`speed_raw / 100` is RPM on this unit**, not the `/64` the XV-11 family
+  uses. The daemon also counts the revolution rate from index wraps and
+  reports both, so the claim can be re-checked instead of believed.
 
-### The one thing that is not settled
+### How those last two were settled
 
-`lidar_view.py` reads distance as the full 16-bit value in mm. The XV-11 /
-Neato family this protocol descends from instead uses bit 15 as *invalid*,
-bit 14 as *signal warning*, and the low 14 bits as the distance — which is
-what `lidar2.py` and `lidar_table.py` assume. Both readings agree on everything
-under 16 384 mm with clean returns, and disagree exactly where it matters.
+Both were open questions when the daemon was written — `lidar_view.py` read
+the full 16-bit distance, `lidar2.py` and `lidar_table.py` masked to 14 bits
+and used the flags, and `speed_raw / 64` produced a number nothing else
+agreed with. Rather than pick one, the daemon was made to count the evidence.
+Fifty seconds of the real scanner running in a room:
 
-The daemon reports the full 16-bit value and separately counts how often those
-two top bits are set (`flag_hi`, `flag_warn` in `/health`):
+    packets    22347        ->  4.97 rev/s  =  298 RPM
+    speed_raw  29946        ->  /64 = 468   /100 = 299.5
+    bit 15 set on 52% of samples
+    zero distances            0
 
-* `flag_hi` stays at **0** while the scanner faces real surfaces → the
-  full-16-bit reading is right, and the flag interpretation can be dropped.
-* `flag_hi` climbs whenever something is out of range or absorbing → the flags
-  are real, and distance should be masked to 14 bits.
+**Distance is 14-bit with flags.** A unit that never once reports a zero, but
+sets bit 15 on half its samples, is using the flag to say "no return" — and
+read as a full 16-bit value those samples would be 32–65 m, which this module
+cannot see. `lidar_view.py` was wrong; `lidar2.py` was right.
 
-Until that is answered, the viewers treat `0` as "no return" and clamp
-anything past the chosen range, which is correct under either reading.
+**The speed divisor is 100, not 64.** The revolution rate counted from index
+wraps is the check: 298 RPM measured against 299.5 from `/100`, while `/64`
+claims 468.
+
+`/health` still reports both: `rpm` is counted from index wraps, `rpm_reported`
+is the module's own figure. If they ever disagree on a different unit, the
+counted one is the one to believe.
 
 ## Health, and what the numbers mean
 
@@ -132,9 +140,14 @@ causes that look identical from a plot:
 | `rates.packets` | good packets a second; zero with bytes arriving means framing, not connection |
 | `rates.revs` | revolutions a second, counted from index wraps. The honest scan rate |
 | `rates.checksum_bad` | rejected candidate boundaries a second. Non-zero = a dirty stream |
+| `rates.invalid` | samples a second with bit 15 set — no return. Half of them indoors is normal; all of them means the laser is blocked or the room is beyond range |
+| `rates.weak` | samples with bit 14 set — a return the module distrusts. Dark or glancing surfaces |
+| `spinning` | whether wraps are still arriving. `motor` is only what the daemon last *told* it to do — an unpowered scanner accepts `startlds$` in silence |
 | `counts.index_bad` | packets whose index is outside `0xA0`–`0xF9` (`lidar_health.py` calls these speed errors) |
 | `points_fresh` | how many of the 360 bins were written in the last 1.5 s. A stuck motor shows here first |
-| `speed_raw` | the raw speed field, undivided — see above |
+| `rpm` | counted from index wraps. The honest one |
+| `rpm_reported` | `speed_raw / 100`, the module's own figure |
+| `speed_raw` | the raw field, undivided |
 
 ## Where the scan shows up
 
@@ -198,8 +211,15 @@ to answer one question each. All of them need the service stopped.
 | `check_stream.py` | stream-level sanity checking |
 | `show_frames.py` | raw frames |
 | `rawtest.py` | is anything arriving at all — bytes/s and silence |
-| `lidar2.py` | the 14-bit-distance + flags reading of the protocol |
+| `lidar2.py` | the 14-bit-distance + flags reading — the one that turned out to be right |
 | `lidar.py` | a `5A A5` framing this unit does not use — reference only |
+
+`lidar_view.py`, `lidar_health.py` and `lidar_table.py` predate the findings
+above: the first two read the full 16-bit distance, so a no-return sample
+plots as tens of metres rather than disappearing, and all three still divide
+speed by 64. They are useful for what they were written for — is it spinning,
+is the stream clean, what is the range at this bearing — but the daemon is the
+one that decodes this unit correctly.
 
 ## Troubleshooting
 
@@ -212,7 +232,12 @@ a framing problem, not a wiring one: wrong baud, or something else holding the
 port.
 
 **Packets arrive, `points_fresh` is low** — the motor is not turning, or is
-turning far too slowly. Check `rates.revs` and the raw speed.
+turning far too slowly. Check `rpm` and `rates.revs`.
+
+**Everything looks healthy but every distance is 0** — `rates.invalid` will be
+running at the full sample rate: the laser is blocked, or nothing is within
+range. `motor: "running"` with `spinning: false` means the scanner is not
+powered; the daemon can only say it sent the command.
 
 **Nothing at all after a reboot** — the motor needs `startlds$` every time the
 scanner is powered up. `LIDAR_AUTOSTART=1` does that when the port opens.
