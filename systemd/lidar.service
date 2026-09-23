@@ -1,0 +1,23 @@
+[Unit]
+Description=LDS-006 lidar daemon — serial scanner to HTTP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The serial port is root:dialout, so the run user has to be in dialout:
+#   sudo usermod -aG dialout ubuntu     (log out and back in)
+User=ubuntu
+WorkingDirectory=/home/ubuntu/lds006-lidar-utils
+EnvironmentFile=-/etc/default/lidar
+ExecStart=/usr/bin/python3 /home/ubuntu/lds006-lidar-utils/lidar_server.py
+# The motor keeps spinning if the process dies, so stop it on the way out.
+ExecStopPost=-/usr/bin/python3 -c "import serial,os; s=serial.Serial(os.environ.get('LIDAR_PORT','/dev/ttyAMA0'),115200,timeout=0.5); s.write(b'stoplds$'); s.flush(); s.close()"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

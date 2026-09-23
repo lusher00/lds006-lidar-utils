@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.swp
+*.swo
+.DS_Store
+**/.DS_Store
+_to_delete/
+logs/
+captures/
+
+# Device-owned: the Pi's own settings live in /etc/default/lidar, not here.
+lidar.env
